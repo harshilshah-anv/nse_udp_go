@@ -1,0 +1,9 @@
+csv_output/
+csv_output_2/
+csv_output_03-12-2025/
+
+*.csv
+*.log
+*.out
+*.bat
+*.sh
