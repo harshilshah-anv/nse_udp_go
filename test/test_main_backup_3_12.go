@@ -153,19 +153,27 @@ type Message7208 struct {
 	LowPrice uint32         // offset 210, 4 bytes (UNSIGNED LONG)
 }
 
-// Message7211 - BCAST_SPD_MBP_DELTA (Spread MBP Delta)
-// Structure: BCAST_HEADER(40) + 6-byte filler + field count(2) + ST_SPD_MBP_DELTA records
-// Real data starts at offset 48 (after 40-byte header + 6-byte space filler + 2-byte field)
+// Message7211 - BCAST_SPD_MBP_DELTA (Spread Market by Price Delta)
+// Structure: BCAST_HEADER(40) + NoOfRecords(2) + MS_SPD_MKT_INFO[5]
+// Each record: 204 bytes, maximum 5 records per packet
+// Used for spread trading (2 legs with different expiry dates)
 type Message7211 struct {
-	Token               int32   // 4 bytes - Token number
-	LastTradedPrice     int32   // 4 bytes - LTP (divide by 100 for actual price)
-	LastTradedQuantity  int32   // 4 bytes - Last trade quantity
-	Volume              int64   // 4 bytes - Total volume (stored as int64)
-	BidPrice            int32   // 4 bytes - Best bid price (divide by 100)
-	BidQuantity         int32   // 4 bytes - Best bid quantity
-	AskPrice            int32   // 4 bytes - Best ask price (divide by 100)
-	AskQuantity         int32   // 4 bytes - Best ask quantity
-	TotalTradedValue    int64   // 8 bytes - Total traded value (divide by 100)
+	Token1              int32   // offset 0, 4 bytes - Token of security with early expiry (LONG)
+	Token2              int32   // offset 4, 4 bytes - Token of security with later expiry (LONG)
+	MbpBuy              int16   // offset 8, 2 bytes - Total number of buys
+	MbpSell             int16   // offset 10, 2 bytes - Total number of sells
+	LastActiveTime      int32   // offset 12, 4 bytes - Last active time (LONG)
+	TradedVolume        uint32  // offset 16, 4 bytes - Traded volume (UNSIGNED LONG)
+	TotalTradedValue    float64 // offset 20, 8 bytes - Total traded value (DOUBLE)
+	// MbpBuys[5] at offset 28-77 (10 bytes each) - skipped for now
+	// MbpSells[5] at offset 78-127 (10 bytes each) - skipped for now  
+	TotalBuyVolume      float64 // offset 128, 8 bytes - Total buy volume (DOUBLE)
+	TotalSellVolume     float64 // offset 136, 8 bytes - Total sell volume (DOUBLE)
+	OpenPriceDifference int32   // offset 144, 4 bytes - Open price difference (LONG)
+	DayHighPriceDifference int32 // offset 148, 4 bytes - Day high price difference (LONG)
+	DayLowPriceDifference int32  // offset 152, 4 bytes - Day low price difference (LONG)
+	LastTradedPriceDifference int32 // offset 156, 4 bytes - LTP difference (LONG)
+	LastUpdateTime      int32   // offset 160, 4 bytes - Last update time (LONG)
 }
 
 // Message7220 - BCAST_LIMIT_PRICE_PROTECTION_RANGE (Limit Price Protection)
@@ -1344,8 +1352,10 @@ func (p *Processor7211) Initialize(timestamp string) error {
 	p.csvWriter = csv.NewWriter(file)
 	
 	headers := []string{
-		"Timestamp", "MessageCode", "Token", "LastTradedPrice", "LastTradedQuantity", 
-		"Volume", "BidPrice", "BidQuantity", "AskPrice", "AskQuantity", "TotalTradedValue",
+		"Timestamp", "MessageCode", "Token1", "Token2", "MbpBuy", "MbpSell",
+		"LastActiveTime", "TradedVolume", "TotalTradedValue", "TotalBuyVolume",
+		"TotalSellVolume", "OpenPriceDifference", "DayHighPriceDifference",
+		"DayLowPriceDifference", "LastTradedPriceDifference", "LastUpdateTime",
 	}
 	p.csvWriter.Write(headers)
 	p.csvWriter.Flush()
@@ -1387,114 +1397,47 @@ func (p *Processor7211) process7211(data []byte) error {
 		return fmt.Errorf("packet too short")
 	}
 	
-	// Check NoOfRecords field at offset 40
-	noOfRecords := uint16(0)
-	if len(data) >= 42 {
-		noOfRecords = binary.BigEndian.Uint16(data[40:42])
+	noOfRecords := binary.BigEndian.Uint16(data[40:42])
+	if noOfRecords == 0 || noOfRecords > 5 {
+		return fmt.Errorf("invalid record count")
 	}
 	
-	if noOfRecords > 0 && noOfRecords <= 10 { // Reasonable multi-record scenario
-		// Process multiple records starting at offset 48 (after 40-byte header + 6-byte filler + 2-byte count)
-		offset := 48
-		recSize := 40 // Basic record size for ST_SPD_MBP_DELTA fields
-		
-		for i := 0; i < int(noOfRecords); i++ {
-			if offset+recSize > len(data) {
-				break
-			}
-			
-			if msg := p.parseMessage7211Direct(data, offset); msg != nil {
-				p.ExportData(msg)
-				atomic.AddInt64(&p.parsedCount, 1)
-			}
-			offset += recSize
+	offset := 42
+	for i := 0; i < int(noOfRecords); i++ {
+		if offset+204 > len(data) {
+			break
 		}
-	} else {
-		// Single record parse (most common case)
-		// DISCOVERY: Offset 40-45 contains spaces (0x20 20 20 20 20 20) - symbol filler
-		// Offset 46-47: Contains field count
-		// Real token data starts at offset 48
-		
-		// Try offset 48 first (most likely)
-		if len(data) >= 48+40 {
-			if msg := p.parseMessage7211Direct(data, 48); msg != nil {
-				p.ExportData(msg)
-				atomic.AddInt64(&p.parsedCount, 1)
-				return nil
-			}
+		recordData := data[offset : offset+204]
+		if msg := p.parseMessage7211(recordData); msg != nil {
+			p.ExportData(msg)
+			atomic.AddInt64(&p.parsedCount, 1)
 		}
-		
-		// Try offset 46 as fallback
-		if len(data) >= 46+40 {
-			if msg := p.parseMessage7211Direct(data, 46); msg != nil {
-				p.ExportData(msg)
-				atomic.AddInt64(&p.parsedCount, 1)
-				return nil
-			}
-		}
+		offset += 204
 	}
 	return nil
 }
 
-// parseMessage7211Direct - Parse 7211 fields directly from message at given offset
-func (p *Processor7211) parseMessage7211Direct(data []byte, startOffset int) *Message7211 {
-	if len(data) < startOffset+40 {
+func (p *Processor7211) parseMessage7211(data []byte) *Message7211 {
+	if len(data) < 204 {
 		return nil
 	}
-	
-	offset := startOffset
-	
-	// Read fields in sequence
-	token := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	lastTradedPrice := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	lastTradedQuantity := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	// Volume - read as int32 (4 bytes)
-	volume := int64(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	bidPrice := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	bidQuantity := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	askPrice := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	askQuantity := int32(binary.BigEndian.Uint32(data[offset:offset+4]))
-	offset += 4
-	
-	// Total traded value - read as int64 (8 bytes)
-	var totalTradedValue int64
-	if len(data) >= offset+8 {
-		totalTradedValue = int64(binary.BigEndian.Uint64(data[offset:offset+8]))
-	}
-	
-	// Validation
-	if token <= 0 || token > 99999999 {
-		return nil
-	}
-	
-	if lastTradedPrice <= 0 || lastTradedPrice > 10000000 { // 1 crore max
-		return nil
-	}
-	
+
 	return &Message7211{
-		Token:              token,
-		LastTradedPrice:    lastTradedPrice,
-		LastTradedQuantity: lastTradedQuantity,
-		Volume:             volume,
-		BidPrice:           bidPrice,
-		BidQuantity:        bidQuantity,
-		AskPrice:           askPrice,
-		AskQuantity:        askQuantity,
-		TotalTradedValue:   totalTradedValue,
+		Token1:              int32(binary.BigEndian.Uint32(data[0:4])),
+		Token2:              int32(binary.BigEndian.Uint32(data[4:8])),
+		MbpBuy:              int16(binary.BigEndian.Uint16(data[8:10])),
+		MbpSell:             int16(binary.BigEndian.Uint16(data[10:12])),
+		LastActiveTime:      int32(binary.BigEndian.Uint32(data[12:16])),
+		TradedVolume:        binary.BigEndian.Uint32(data[16:20]),
+		TotalTradedValue:    float64FromBytes(data[20:28]),
+		// Skip MbpBuys[5] at offset 28-77 and MbpSells[5] at offset 78-127
+		TotalBuyVolume:      float64FromBytes(data[128:136]),
+		TotalSellVolume:     float64FromBytes(data[136:144]),
+		OpenPriceDifference: int32(binary.BigEndian.Uint32(data[144:148])),
+		DayHighPriceDifference: int32(binary.BigEndian.Uint32(data[148:152])),
+		DayLowPriceDifference:  int32(binary.BigEndian.Uint32(data[152:156])),
+		LastTradedPriceDifference: int32(binary.BigEndian.Uint32(data[156:160])),
+		LastUpdateTime:      int32(binary.BigEndian.Uint32(data[160:164])),
 	}
 }
 
@@ -1504,16 +1447,21 @@ func (p *Processor7211) exportToCSV(msg *Message7211) {
 
 	record := []string{
 		time.Now().Format("2006-01-02 15:04:05.000"),
-		"7211",
-		fmt.Sprintf("%d", msg.Token),
-		fmt.Sprintf("%.2f", float64(msg.LastTradedPrice)/100.0),
-		fmt.Sprintf("%d", msg.LastTradedQuantity),
-		fmt.Sprintf("%d", msg.Volume),
-		fmt.Sprintf("%.2f", float64(msg.BidPrice)/100.0),
-		fmt.Sprintf("%d", msg.BidQuantity),
-		fmt.Sprintf("%.2f", float64(msg.AskPrice)/100.0),
-		fmt.Sprintf("%d", msg.AskQuantity),
-		fmt.Sprintf("%.2f", float64(msg.TotalTradedValue)/100.0),
+		fmt.Sprintf("%d", p.messageCode),
+		fmt.Sprintf("%d", msg.Token1),
+		fmt.Sprintf("%d", msg.Token2),
+		fmt.Sprintf("%d", msg.MbpBuy),
+		fmt.Sprintf("%d", msg.MbpSell),
+		fmt.Sprintf("%d", msg.LastActiveTime),
+		fmt.Sprintf("%d", msg.TradedVolume),
+		fmt.Sprintf("%.2f", msg.TotalTradedValue),
+		fmt.Sprintf("%.2f", msg.TotalBuyVolume),
+		fmt.Sprintf("%.2f", msg.TotalSellVolume),
+		fmt.Sprintf("%.2f", float64(msg.OpenPriceDifference)/100.0),
+		fmt.Sprintf("%.2f", float64(msg.DayHighPriceDifference)/100.0),
+		fmt.Sprintf("%.2f", float64(msg.DayLowPriceDifference)/100.0),
+		fmt.Sprintf("%.2f", float64(msg.LastTradedPriceDifference)/100.0),
+		fmt.Sprintf("%d", msg.LastUpdateTime),
 	}
 
 	p.csvWriter.Write(record)
@@ -1769,38 +1717,19 @@ func (p *Processor7340) ParsePacket(data []byte) error {
 	if messageCode != 7340 {
 		return fmt.Errorf("not a 7340 message: %d", messageCode)
 	}
+	
 
-	// Check NoOfRecords field at offset 40-42
-	if len(data) >= 42 {
-		noOfRecords := binary.BigEndian.Uint16(data[40:42])
-		
-		if noOfRecords > 0 && noOfRecords <= 10 {
-			// Process multiple records starting at offset 42
-			offset := 42
-			recSize := 298
-			
-			for i := 0; i < int(noOfRecords); i++ {
-				if offset+recSize > len(data) {
-					break
-				}
-				
-				rec := data[offset : offset+recSize]
-				
-				if msg := p.parseMessage7340(rec); msg != nil {
-					p.ExportData(msg)
-					atomic.AddInt64(&p.parsedCount, 1)
-				}
-				offset += recSize
-			}
-		} else {
-			// Try parsing as single record starting at offset 40
-			if len(data) >= 40+298 {
-				rec := data[40:40+298]
-				if msg := p.parseMessage7340(rec); msg != nil {
-					p.ExportData(msg)
-					atomic.AddInt64(&p.parsedCount, 1)
-				}
-			}
+	
+	// Parse 7340 records - assume single 298-byte record after 40-byte header
+	p.writeDebugToFile(fmt.Sprintf("Debug: Processing 7340 message %d", len(data)))
+	if len(data) >= 40+298 {
+		recordData := data[40 : 40+298]
+		p.writeDebugToFile(fmt.Sprintf("Debug: 7340 record data length %d", len(recordData)))
+		msg := p.parseMessage7340(recordData)
+		p.writeDebugToFile(fmt.Sprintf("Debug: Parsed 7340 message %+v", msg))
+		if msg != nil {
+			p.ExportData(msg)
+			atomic.AddInt64(&p.parsedCount, 1)
 		}
 	}
 	
@@ -1833,167 +1762,31 @@ func (p *Processor7340) ExportData(data interface{}) error {
 }
 
 func (p *Processor7340) parseMessage7340(data []byte) *Message7340 {
-	if len(data) < 100 {
+	if len(data) < 32 {
 		return nil
 	}
 
-	// Parse the NSE 7340 structure using the working implementation
-	msg := p.parseNSE7340Structure(data)
-	
-	return msg
-}
 
-// parseNSE7340Structure - Parse NSE 7340 MS_SECURITY_UPDATE_INFO structure
-// Based on NSE documentation with exact field offsets that work
-func (p *Processor7340) parseNSE7340Structure(data []byte) *Message7340 {
-	if len(data) < 40 {
-		return nil
-	}
-	
-	// Parse with Big Endian since that's where we found valid tokens
-	msg := p.tryParseNSEStructure(data, 0, "BE")
-	return msg
-}
 
-// tryParseNSEStructure - Parse the NSE field structure with exact working offsets
-func (p *Processor7340) tryParseNSEStructure(data []byte, offset int, endianness string) *Message7340 {
-	tokenOffset := 8
-	symbolOffset := 12  
-	strikeOffset := 34
-	
-	if tokenOffset+4 > len(data) || symbolOffset+10 > len(data) || strikeOffset+4 > len(data) {
-		return nil
-	}
-	
-	// Extract fields using Big Endian
-	token := binary.BigEndian.Uint32(data[tokenOffset:tokenOffset+4])
-	strikePrice := binary.BigEndian.Uint32(data[strikeOffset:strikeOffset+4])
-	
-	// Validate token range
-	if token < 25000 || token > 900000 {
-		return nil
-	}
-	
-	// Extract symbol
-	symbolBytes := data[symbolOffset:symbolOffset+10]
-	
-	// Search for option type (CE/PE)
-	var optionBytes []byte
-	searchOffsets := []int{36, 44, 38, 40, 42, 46, 48}
-	
-	for _, searchOffset := range searchOffsets {
-		if searchOffset+2 <= len(data) {
-			testBytes := data[searchOffset:searchOffset+2]
-			testType := strings.TrimSpace(string(testBytes))
-			
-			if testType == "CE" || testType == "PE" {
-				optionBytes = testBytes
-				break
-			}
-		}
-	}
-	
-	// Extract expiry date - search for valid date patterns
-	var expiryDate uint32
-	expiryOffsets := []int{26, 28, 30, 32, 38, 40, 42}
-	
-	for _, expiryOffset := range expiryOffsets {
-		if expiryOffset+4 <= len(data) {
-			testExpiry := binary.BigEndian.Uint32(data[expiryOffset:expiryOffset+4])
-			
-			if p.isValidExpiryDate(testExpiry) {
-				expiryDate = testExpiry
-				break
-			}
-		}
-	}
-	
-	// Validate strike price
-	strikeFloat := float64(strikePrice) / 100.0
-	if strikePrice > 0 && (strikeFloat < 1.0 || strikeFloat > 100000.0) {
-		return nil
-	}
-	
-	// Create the message
 	msg := &Message7340{
-		Token: token,
-		StrikePrice: strikePrice,
-		ExpiryDate: expiryDate,
+		Token:       binary.BigEndian.Uint32(data[0:4]),
+		ExpiryDate:  binary.BigEndian.Uint32(data[16:20]),
+		StrikePrice: binary.BigEndian.Uint32(data[20:24]),
 	}
 	
-	copy(msg.Symbol[:], symbolBytes)
+	copy(msg.Symbol[:], data[4:14])
+	copy(msg.Series[:], data[14:16])
+	copy(msg.InstrumentName[:], data[24:30])
+	copy(msg.OptionType[:], data[30:32])
 	
-	if len(optionBytes) >= 2 {
-		copy(msg.OptionType[:], optionBytes)
-	}
-	
-	// Extract series (2 bytes after symbol)
-	seriesOffset := symbolOffset + 10
-	if seriesOffset+2 <= len(data) {
-		copy(msg.Series[:], data[seriesOffset:seriesOffset+2])
-	}
-	
-	// Set default instrument name
-	copy(msg.InstrumentName[:], []byte("OPTIDX"))
+
 	
 	return msg
-}
-
-// isValidExpiryDate - Check if a uint32 value looks like a valid expiry date
-func (p *Processor7340) isValidExpiryDate(date uint32) bool {
-	// Check for DDMMYYYY format (e.g., 26022025 for 26 Feb 2025)
-	if date >= 1012024 && date <= 31122030 {
-		dateStr := fmt.Sprintf("%08d", date)
-		if len(dateStr) == 8 {
-			day := dateStr[0:2]
-			month := dateStr[2:4]
-			year := dateStr[4:8]
-			
-			// Basic validation
-			if day >= "01" && day <= "31" && 
-			   month >= "01" && month <= "12" && 
-			   year >= "2024" && year <= "2030" {
-				return true
-			}
-		}
-	}
-	
-	// Check for YYYYMMDD format (e.g., 20250226)
-	if date >= 20240101 && date <= 20301231 {
-		dateStr := fmt.Sprintf("%08d", date)
-		if len(dateStr) == 8 {
-			year := dateStr[0:4]
-			month := dateStr[4:6]
-			day := dateStr[6:8]
-			
-			// Basic validation
-			if year >= "2024" && year <= "2030" && 
-			   month >= "01" && month <= "12" && 
-			   day >= "01" && day <= "31" {
-				return true
-			}
-		}
-	}
-	
-	return false
 }
 
 func (p *Processor7340) exportToCSV(msg *Message7340) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
-	// Format expiry date for better readability
-	expiryStr := fmt.Sprintf("%d", msg.ExpiryDate)
-	if msg.ExpiryDate > 19000000 && msg.ExpiryDate < 99999999 {
-		// Looks like DDMMYYYY format, convert to readable date
-		dateStr := fmt.Sprintf("%d", msg.ExpiryDate)
-		if len(dateStr) == 8 {
-			day := dateStr[0:2]
-			month := dateStr[2:4] 
-			year := dateStr[4:8]
-			expiryStr = fmt.Sprintf("%s-%s-%s", year, month, day)
-		}
-	}
 
 	record := []string{
 		time.Now().Format("2006-01-02 15:04:05.000"),
@@ -2002,7 +1795,7 @@ func (p *Processor7340) exportToCSV(msg *Message7340) {
 		strings.TrimSpace(string(msg.Symbol[:])),
 		strings.TrimSpace(string(msg.Series[:])),
 		strings.TrimSpace(string(msg.InstrumentName[:])),
-		expiryStr,
+		fmt.Sprintf("%d", msg.ExpiryDate),
 		fmt.Sprintf("%.2f", float64(msg.StrikePrice)/100.0),
 		strings.TrimSpace(string(msg.OptionType[:])),
 	}
@@ -2229,9 +2022,7 @@ func (f *MessageFactory) ProcessMessageByCode(data []byte) error {
 		return fmt.Errorf("packet too short")
 	}
 	
-	// IMPORTANT: After 8-byte skip in processUDPPacket, message code is at offset 10-12
-	// (within BCAST_HEADER at offset 10-11)
-	messageCode := binary.BigEndian.Uint16(data[10:12])
+	messageCode := binary.BigEndian.Uint16(data[18:20])
 	
 	// Handle special case for 17201 (use 7201 processor class)
 	if messageCode == 17201 {
@@ -2673,21 +2464,11 @@ func processUDPPacket(data []byte) {
 		finalData = cPackData[2:]
 	}
 
-	// CRITICAL FIX: Per NSE documentation (Page 152):
-	// "Inside the broadcast data, the first 8 bytes before the message header / broadcast header should be ignored.
-	//  The message header / broadcast header starts from the 9th byte."
-	// So we need to skip first 8 bytes after decompression
-	
-	if len(finalData) < 28 { // Need at least 8 (skip) + 20 (min header)
+	if len(finalData) < 20 {
 		return
 	}
-	
-	// Skip first 8 bytes - BCAST_HEADER starts at byte 8 (0-indexed)
-	finalData = finalData[8:]
-	
-	// Now BCAST_HEADER is at offset 0
-	// For broadcast messages, TransactionCode is in BCAST_HEADER at offset 10-12
-	messageCode := binary.BigEndian.Uint16(finalData[10:12])
+
+	messageCode := binary.BigEndian.Uint16(finalData[18:20])
 
 	// 🔍 PIPELINE TRACKING - Stage by Stage
 	// Stage 1: Message Code Received

@@ -1,12 +1,12 @@
-// NSE Multicast UDP Receiver - Simplified for Message 7340 Only
+// NSE Multicast UDP Receiver - Simplified for Message 17130 Only
 // 
-// FOCUS: Only process message code 7340 (BCAST_SEC_MSTR_CHNG_PERIODIC)
-// OUTPUT: csv_output_2/message_7340_TIMESTAMP.csv
+// FOCUS: Only process message code 17130 (ENHNCD_MKT_MVMT_CM_OI_IN - Enhanced Market Movement CM Open Interest)
+// OUTPUT: csv_output_2/message_17130_TIMESTAMP.csv
 //
 // USAGE:
 // ======
 // Run: go run test_2_main.go lzo_decompressor_safe.go
-// Output: csv_output_2/message_7340_TIMESTAMP.csv
+// Output: csv_output_2/message_17130_TIMESTAMP.csv
 
 package main
 
@@ -14,31 +14,41 @@ import (
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 // =============================================================================
-// MESSAGE STRUCTURE FOR 7340
+// MESSAGE STRUCTURE FOR 17130
 // =============================================================================
 
-// Message7340 - BCAST_SEC_MSTR_CHNG_PERIODIC (Security Master Change Periodic)
-// Structure: BCAST_HEADER(40) + MS_SECURITY_UPDATE_INFO (298 bytes)
-// Security master data changes broadcast periodically
-type Message7340 struct {
-	Token          uint32    // 4 bytes - Token number
-	Symbol         [10]byte  // 10 bytes - Security symbol
-	Series         [2]byte   // 2 bytes - Series (EQ, FO, etc.)
-	InstrumentName [6]byte   // 6 bytes - Instrument name
-	ExpiryDate     uint32    // 4 bytes - Expiry date
-	StrikePrice    uint32    // 4 bytes - Strike price
-	OptionType     [2]byte   // 2 bytes - Option type (CE, PE)
+// Message17130 - ENHNCD_MKT_MVMT_CM_OI_IN (Enhanced Market Movement CM Open Interest)
+// 
+// This message broadcasts AGGREGATED Open Interest by UNDERLYING ASSET
+// - TokenNo: Underlying asset token (e.g., 1232=NIFTY, 2475=BANKNIFTY)
+// - CurrentOI: Total OI across ALL derivatives of that underlying
+// 
+// Structure: BCAST_HEADER (40 bytes) + OPEN_INTEREST records (12 bytes each)
+// Maximum 39 records per message
+// 
+// NOTE: These are NOT individual contract tokens (which are typically 40000+)
+//       To get symbol names, use NSE Security Master file for token mapping
+type Message17130 struct {
+	TransactionCode uint16 // Always 17130
+	NoOfRecords     uint16 // Number of Open Interest records
+}
+
+// OpenInterest17130 - Individual Open Interest record (12 bytes)
+// Per NSE Table 99_A: Only 2 fields available, no additional data
+type OpenInterest17130 struct {
+	TokenNo   uint32 // Underlying asset token (NOT derivative contract token)
+	CurrentOI int64  // Total Open Interest (LONG LONG - 8 bytes)
 }
 
 // =============================================================================
@@ -53,18 +63,21 @@ var (
 	decompressedCount   int64
 	decompressionErrors int64
 	
-	// 7340 specific counters
-	message7340Count   int64
-	message7340Saved   int64
+	// 17130 specific counters
+	message17130Count   int64
+	message17130Saved   int64
 	
-	// CSV file for 7340
-	csvFile7340        *os.File
-	csvWriter7340      *csv.Writer
+	// CSV file for 17130
+	csvFile17130        *os.File
+	csvWriter17130      *csv.Writer
 	
 	// Control channels
 	startTime           time.Time
 	shutdownChan        chan bool
 	packetChan          chan []byte
+	
+	// Debug: Track all message codes
+	messageCodeCounts   map[uint16]int64
 )
 
 // =============================================================================
@@ -72,14 +85,8 @@ var (
 // =============================================================================
 
 func main() {
-	fmt.Println("================================================================================")
-	fmt.Println("NSE MULTICAST UDP RECEIVER - MESSAGE 7340 ONLY")
-	fmt.Println("================================================================================")
-	fmt.Println("🎯 FOCUS: Only processing message code 7340 (BCAST_SEC_MSTR_CHNG_PERIODIC)")
-	fmt.Println("📁 OUTPUT: csv_output_2/message_7340_TIMESTAMP.csv")
-	fmt.Println("⏰ NOTE: Data is only available during NSE market hours (9:15 AM - 3:30 PM)")
-	fmt.Println("📅 Market Days: Monday to Friday (excluding NSE holidays)")
-	fmt.Println("================================================================================")
+	// Initialize debug tracking
+	messageCodeCounts = make(map[uint16]int64)
 
 	startTime = time.Now()
 	shutdownChan = make(chan bool)
@@ -87,13 +94,13 @@ func main() {
 
 	// Create output directory
 	if err := os.MkdirAll("csv_output_2", 0755); err != nil {
-		fmt.Printf("❌ Failed to create csv_output_2 directory: %v\n", err)
+		log.Fatalf("Failed to create csv_output_2 directory: %v", err)
 		return
 	}
 
-	// Initialize CSV file for 7340
-	if err := initialize7340CSV(); err != nil {
-		fmt.Printf("❌ Failed to initialize 7340 CSV: %v\n", err)
+	// Initialize CSV file for 17130
+	if err := initialize17130CSV(); err != nil {
+		log.Fatalf("Failed to initialize 17130 CSV: %v", err)
 		return
 	}
 
@@ -122,25 +129,23 @@ func main() {
 		}
 	}()
 
-	fmt.Println("🚀 Starting UDP listener for message 7340...")
-	fmt.Println("⏹️  Press Ctrl+C to stop\n")
+
 
 	// Wait for Ctrl+C
 	<-sigChan
-	fmt.Println("\n\n🛑 Shutdown signal received, stopping...")
+
 
 	close(shutdownChan)
 	time.Sleep(1 * time.Second)
 
-	// Close CSV file
-	if csvWriter7340 != nil {
-		csvWriter7340.Flush()
+	// Close CSV files
+	if csvWriter17130 != nil {
+		csvWriter17130.Flush()
 	}
-	if csvFile7340 != nil {
-		csvFile7340.Close()
+	if csvFile17130 != nil {
+		csvFile17130.Close()
 	}
 
-	// Print final statistics
 	printFinalStats()
 }
 
@@ -148,29 +153,30 @@ func main() {
 // CSV INITIALIZATION
 // =============================================================================
 
-func initialize7340CSV() error {
+func initialize17130CSV() error {
 	timestamp := time.Now().Format("20060102_150405")
-	filename := filepath.Join("csv_output_2", fmt.Sprintf("message_7340_%s.csv", timestamp))
+	filename := filepath.Join("csv_output_2", fmt.Sprintf("message_17130_%s.csv", timestamp))
 	
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
 	
-	csvFile7340 = file
-	csvWriter7340 = csv.NewWriter(file)
+	csvFile17130 = file
+	csvWriter17130 = csv.NewWriter(file)
 	
 	// Write headers
 	headers := []string{
-		"Timestamp", "MessageCode", "Token", "Symbol", "Series", 
-		"InstrumentName", "ExpiryDate", "StrikePrice", "OptionType",
+		"Timestamp", "TransactionCode", "NoOfRecords", "TokenNo", "CurrentOI",
 	}
-	csvWriter7340.Write(headers)
-	csvWriter7340.Flush()
-	
-	fmt.Printf("✅ Created CSV file: %s\n", filename)
+	csvWriter17130.Write(headers)
+	csvWriter17130.Flush()
+
+	fmt.Printf("📁 Created CSV file for Message 17130: %s\n", filename)
 	return nil
 }
+
+
 
 // =============================================================================
 // UDP LISTENER
@@ -180,7 +186,16 @@ func startUDPListener() {
 	multicastIP := "233.1.2.5"
 	//multicastIP := "231.31.31.4"
 	port := 34330
-	//port := 18901
+	//port := 55655
+	
+	fmt.Printf("\n╔════════════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║ NSE Message 17130 Receiver                                ║\n")
+	fmt.Printf("╚════════════════════════════════════════════════════════════╝\n")
+	fmt.Printf("📡 Multicast: %s:%d\n", multicastIP, port)
+	fmt.Printf("🎯 Target: Message 17130 (ENHNCD_MKT_MVMT_CM_OI_IN)\n")
+	fmt.Printf("📊 Statistics every 10 seconds | Progress every 1000 packets\n")
+	fmt.Printf("⏱️  Started at: %s\n\n", time.Now().Format("15:04:05"))
+	fmt.Printf("Waiting for packets...\n\n")
 	
 	// Create multicast address
 	addr := &net.UDPAddr{
@@ -191,7 +206,7 @@ func startUDPListener() {
 	// Join multicast group
 	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
 	if err != nil {
-		fmt.Printf("❌ Failed to join multicast group: %v\n", err)
+		log.Fatalf("Failed to join multicast group: %v", err)
 		return
 	}
 	defer conn.Close()
@@ -199,7 +214,7 @@ func startUDPListener() {
 	// Set read buffer size
 	conn.SetReadBuffer(2 * 1024 * 1024)
 
-	fmt.Printf("✅ Joined multicast group: %s:%d\n", multicastIP, port)
+
 
 	buffer := make([]byte, 2048)
 
@@ -281,186 +296,126 @@ func processUDPPacket(data []byte) {
 		finalData = cPackData[2:]
 	}
 
-	if len(finalData) < 20 {
+	// IMPORTANT: Per NSE documentation (Page 152):
+	// "Inside the broadcast data, the first 8 bytes before the message header / broadcast header should be ignored.
+	//  The message header / broadcast header starts from the 9th byte."
+	// So we need to skip first 8 bytes after decompression
+	
+	if len(finalData) < 28 { // Need at least 8 (skip) + 20 (min header)
 		return
 	}
-
-	messageCode := binary.BigEndian.Uint16(finalData[18:20])
-
-	// Debug: Show what message codes we're seeing (first 20 packets)
-	if atomic.LoadInt64(&packetCount) <= 20 {
-		fmt.Printf("📊 DEBUG: Packet #%d - Message Code: %d (0x%04X)\n", 
-			atomic.LoadInt64(&packetCount), messageCode, messageCode)
+	
+	// Skip first 8 bytes - BCAST_HEADER starts at byte 8 (0-indexed)
+	finalData = finalData[8:]
+	
+	// Now BCAST_HEADER is at offset 0
+	// For broadcast messages, TransactionCode is in BCAST_HEADER at offset 10-12
+	messageCode := binary.BigEndian.Uint16(finalData[10:12])
+	
+	// Track all message codes for debugging
+	messageCodeCounts[messageCode]++
+	
+	// Show message code distribution every 1000 packets
+	totalPackets := atomic.LoadInt64(&packetCount)
+	if totalPackets%1000 == 0 && totalPackets > 0 {
+		has17130 := messageCodeCounts[17130] > 0
+		status := "❌ NOT FOUND"
+		if has17130 {
+			status = fmt.Sprintf("✅ Found %d times", messageCodeCounts[17130])
+		}
+		fmt.Printf("📊 After %d packets | Message 17130: %s | %d unique codes\n", 
+			totalPackets, status, len(messageCodeCounts))
 	}
 
-	// Only process message code 7340
-	if messageCode == 7340 {
-		process7340Message(finalData)
+	// Process ONLY message 17130
+	if messageCode == 17130 {
+		process17130Message(finalData)
 	}
 }
 
 // =============================================================================
-// MESSAGE 7340 PROCESSOR
+// MESSAGE 17130 PROCESSOR
 // =============================================================================
 
-func process7340Message(data []byte) {
-	if len(data) < 44 { // 40 hdr + 2 NoOfRecords + 2 spare
+func process17130Message(data []byte) {
+	if len(data) < 40 {
 		return
 	}
 
-	if binary.BigEndian.Uint16(data[18:20]) != 7340 {
-		return
+	atomic.AddInt64(&message17130Count, 1)
+	currentCount := atomic.LoadInt64(&message17130Count)
+	
+	// Parse BCAST_HEADER (40 bytes) - used for broadcast messages
+	// According to documentation (Table 3 BCAST_HEADER):
+	// Offset 0-1: Reserved (CHAR 2)
+	// Offset 2-3: Reserved (CHAR 2)
+	// Offset 4-7: LogTime (LONG)
+	// Offset 8-9: AlphaChar (CHAR 2)
+	// Offset 10-11: TransactionCode (SHORT) *** THIS IS THE KEY ***
+	// Offset 12-13: ErrorCode (SHORT)
+	// Offset 14-17: BCSeqNo (LONG)
+	// Offset 18: Reserved (CHAR 1)
+	// Offset 19-21: Reserved (CHAR 3)
+	// Offset 22-29: TimeStamp2 (CHAR 8)
+	// Offset 30-37: Filler (8 BYTE)
+	// Offset 38-39: MessageLength (SHORT)
+	
+	transactionCode := binary.BigEndian.Uint16(data[10:12])
+	noOfRecords := binary.BigEndian.Uint16(data[12:14])
+	
+	if currentCount == 1 {
+		fmt.Printf("\n✅ First Message 17130: %d records (underlying assets)\n", noOfRecords)
+		fmt.Printf("   Note: TokenNo represents underlying asset tokens (indices/stocks)\n")
+		fmt.Printf("         Not individual derivative contracts\n\n")
 	}
-
-	atomic.AddInt64(&message7340Count, 1)
-
-	noOfRecords := binary.BigEndian.Uint16(data[40:42])
-	if noOfRecords == 0 || noOfRecords > 10 {
-		// some exchanges send 0 and still pack 1 record; fall back to scan
-		noOfRecords = 1
-	}
-
-	offset := 42
-	recSize := 298
-
+	
+	// Parse Open Interest records
+	// Per documentation Table 98_A: OPEN_INTEREST array starts at offset 40
+	// This is 40 bytes from the start of the structure (which includes BCAST_HEADER)
+	// Since BCAST_HEADER is 40 bytes and is included in the offset count,
+	// the OPEN_INTEREST array actually starts right after the 40-byte header
+	
+	offset := 40
+	recordSize := 12
+	
 	for i := 0; i < int(noOfRecords); i++ {
-		if offset+recSize > len(data) {
+		if offset+recordSize > len(data) {
 			break
 		}
-		rec := data[offset : offset+recSize]
-		if msg := parseMessage7340(rec); msg != nil {
-			exportToCSV(msg)
-			atomic.AddInt64(&message7340Saved, 1)
+		
+		// Parse ENHNCD_OPEN_INTEREST: TokenNo (4 bytes) + CurrentOI (8 bytes)
+		tokenNo := binary.BigEndian.Uint32(data[offset : offset+4])
+		currentOI := int64(binary.BigEndian.Uint64(data[offset+4 : offset+12]))
+		
+		// Show first record of first message only
+		if currentCount == 1 && i == 0 {
+			fmt.Printf("Sample: Token %d → CurrentOI: %d\n\n", tokenNo, currentOI)
 		}
-		offset += recSize
+		
+		// Export to CSV
+		exportToCSV(transactionCode, noOfRecords, tokenNo, currentOI)
+		atomic.AddInt64(&message17130Saved, 1)
+		
+		offset += recordSize
 	}
 }
 
-// parseMessage7340 - Strict FO parser according to NSE specification
-func parseMessage7340(data []byte) *Message7340 {
-	if len(data) < 32 {
-		return nil
-	}
-
-	// Analyzing actual NSE F&O packet structure based on raw bytes
-	// Token is likely at the beginning of the security record (position 0-4)
-	// But let's try different positions to find the correct FO token
-	
-	// Method 1: Try token at different positions and validate
-	var candidateToken uint32
-	var tokenOffset int = -1
-	
-	// Test token positions: 0, 4, 8, 32, etc.
-	testPositions := []int{0, 4, 8, 32}
-	
-	for _, pos := range testPositions {
-		if pos+4 <= len(data) {
-			testToken := binary.BigEndian.Uint32(data[pos:pos+4])
-			// F&O tokens are typically in range 40000-999999
-			if testToken >= 40000 && testToken <= 999999 {
-				candidateToken = testToken
-				tokenOffset = pos
-				break
-			}
-		}
-	}
-	
-	// If no valid F&O token found, try little-endian
-	if tokenOffset == -1 {
-		for _, pos := range testPositions {
-			if pos+4 <= len(data) {
-				testToken := binary.LittleEndian.Uint32(data[pos:pos+4])
-				if testToken >= 40000 && testToken <= 999999 {
-					candidateToken = testToken
-					tokenOffset = pos
-					break
-				}
-			}
-		}
-	}
-	
-	msg := &Message7340{
-		Token:      candidateToken,
-		ExpiryDate: binary.BigEndian.Uint32(data[32:36]), // Will refine after token is correct
-		StrikePrice: binary.BigEndian.Uint32(data[36:40]),
-	}
-	copy(msg.InstrumentName[:], data[9:15])   // "OPTIDX" at position 9-14
-	copy(msg.Symbol[:],         data[15:25])  // "NIFTY" starts at position 15
-	copy(msg.Series[:],         data[25:27])  // Series after symbol
-	copy(msg.OptionType[:],     data[37:39])  // "CE"/"PE" around position 37-38
-
-	sym  := strings.TrimSpace(string(msg.Symbol[:]))
-	ser  := strings.TrimSpace(string(msg.Series[:]))
-	inst := strings.TrimSpace(string(msg.InstrumentName[:]))
-	opt  := strings.TrimSpace(string(msg.OptionType[:]))
-
-	// Debug: Show what we're parsing (first 10 records)
-	if atomic.LoadInt64(&message7340Count) <= 10 {
-		fmt.Printf("🔍 DEBUG: Parsing record #%d\n", atomic.LoadInt64(&message7340Count))
-		fmt.Printf("   Token: %d (from offset %d), Symbol: %q, Series: %q, Instrument: %q, Option: %q\n", 
-			msg.Token, tokenOffset, sym, ser, inst, opt)
-		
-		// Show token analysis at different positions
-		fmt.Printf("   TOKEN ANALYSIS:\n")
-		for _, pos := range []int{0, 4, 8, 32} {
-			if pos+4 <= len(data) {
-				bigEndian := binary.BigEndian.Uint32(data[pos:pos+4])
-				littleEndian := binary.LittleEndian.Uint32(data[pos:pos+4])
-				fmt.Printf("     Pos %d: BE=%d, LE=%d\n", pos, bigEndian, littleEndian)
-			}
-		}
-		
-		// Show raw bytes to understand the actual data structure
-		fmt.Printf("   RAW BYTES (first 40): ")
-		for i := 0; i < 40 && i < len(data); i++ {
-			fmt.Printf("%02X ", data[i])
-		}
-		fmt.Printf("\n")
-		
-		// Show ASCII view
-		fmt.Printf("   ASCII VIEW (first 40): ")
-		for i := 0; i < 40 && i < len(data); i++ {
-			if data[i] >= 32 && data[i] <= 126 {
-				fmt.Printf("%c", data[i])
-			} else {
-				fmt.Printf(".")
-			}
-		}
-		fmt.Printf("\n")
-	}
-
-	// SAVE ALL DATA TO CSV FIRST - No validation rejection for now
-	// This will help us see the actual data structure and fix parsing
-	
-	if atomic.LoadInt64(&message7340Count) <= 10 {
-		fmt.Printf("   💾 SAVING TO CSV: All data saved for analysis\n")
-		fmt.Printf("   Token: %d (offset %d), Symbol: %q, Series: %q, Instrument: %q, Option: %q\n", 
-			msg.Token, tokenOffset, sym, ser, inst, opt)
-	}
-	return msg
-}
-
-
-
-func exportToCSV(msg *Message7340) {
-	if csvWriter7340 == nil {
+func exportToCSV(transactionCode, noOfRecords uint16, tokenNo uint32, currentOI int64) {
+	if csvWriter17130 == nil {
+		fmt.Printf("CSV writer is nil!\n")
 		return
 	}
 
 	record := []string{
 		time.Now().Format("2006-01-02 15:04:05.000"),
-		"7340",
-		fmt.Sprintf("%d", msg.Token),
-		strings.TrimSpace(string(msg.Symbol[:])),
-		strings.TrimSpace(string(msg.Series[:])),
-		strings.TrimSpace(string(msg.InstrumentName[:])),
-		fmt.Sprintf("%d", msg.ExpiryDate),
-		fmt.Sprintf("%.2f", float64(msg.StrikePrice)/100.0),
-		strings.TrimSpace(string(msg.OptionType[:])),
+		fmt.Sprintf("%d", transactionCode),
+		fmt.Sprintf("%d", noOfRecords),
+		fmt.Sprintf("%d", tokenNo),
+		fmt.Sprintf("%d", currentOI),
 	}
 
-	csvWriter7340.Write(record)
-	csvWriter7340.Flush()
+	csvWriter17130.Write(record)
+	csvWriter17130.Flush()
 }
 
 // =============================================================================
@@ -470,90 +425,27 @@ func exportToCSV(msg *Message7340) {
 func printStats() {
 	duration := time.Since(startTime).Seconds()
 	packets := atomic.LoadInt64(&packetCount)
-	bytes := atomic.LoadInt64(&totalBytes)
-	compressed := atomic.LoadInt64(&compressedCount)
-	decompressed := atomic.LoadInt64(&decompressedCount)
-	errors := atomic.LoadInt64(&decompressionErrors)
-	msg7340 := atomic.LoadInt64(&message7340Count)
-	saved7340 := atomic.LoadInt64(&message7340Saved)
+	msg17130 := atomic.LoadInt64(&message17130Count)
+	saved17130 := atomic.LoadInt64(&message17130Saved)
 
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("📊 REAL-TIME STATISTICS - MESSAGE 7340 ONLY")
-	fmt.Println(strings.Repeat("=", 60))
-	
 	if duration > 0 {
-		fmt.Printf("⏱️  Runtime: %.1f seconds\n", duration)
-		fmt.Printf("📦 Total Packets: %d (%.1f packets/sec)\n", packets, float64(packets)/duration)
-		fmt.Printf("📊 Total Bytes: %d (%.1f KB/sec)\n", bytes, float64(bytes)/duration/1024)
-		fmt.Printf("🗜️  Compressed: %d | Decompressed: %d | Errors: %d\n", compressed, decompressed, errors)
-		fmt.Printf("🎯 Message 7340: %d received | %d saved to CSV\n", msg7340, saved7340)
-		
-		if msg7340 > 0 {
-			successRate := float64(saved7340) / float64(msg7340) * 100
-			fmt.Printf("✅ Success Rate: %.1f%% (%d/%d)\n", successRate, saved7340, msg7340)
+		status := "❌ NOT FOUND"
+		if msg17130 > 0 {
+			status = "✅ RECEIVING"
 		}
+		
+		fmt.Printf("⏱️  %.0fs | 📦 %d pkts (%.0f/s) | 🎯 17130: %s | %d msgs, %d records\n", 
+			duration, packets, float64(packets)/duration, status, msg17130, saved17130)
 	}
-	
-	fmt.Println(strings.Repeat("=", 60))
 }
 
 func printFinalStats() {
 	duration := time.Since(startTime)
 	packets := atomic.LoadInt64(&packetCount)
-	bytes := atomic.LoadInt64(&totalBytes)
-	compressed := atomic.LoadInt64(&compressedCount)
-	decompressed := atomic.LoadInt64(&decompressedCount)
-	errors := atomic.LoadInt64(&decompressionErrors)
-	msg7340 := atomic.LoadInt64(&message7340Count)
-	saved7340 := atomic.LoadInt64(&message7340Saved)
+	msg17130 := atomic.LoadInt64(&message17130Count)
+	saved17130 := atomic.LoadInt64(&message17130Saved)
 
-	fmt.Println("\n" + strings.Repeat("=", 80))
-	fmt.Println("📊 FINAL STATISTICS - MESSAGE 7340 PROCESSOR")
-	fmt.Println(strings.Repeat("=", 80))
-	
-	fmt.Printf("⏱️  Total Runtime: %v\n", duration)
-	fmt.Printf("📦 Total Packets Processed: %d\n", packets)
-	fmt.Printf("📊 Total Data Volume: %d bytes (%.2f MB)\n", bytes, float64(bytes)/(1024*1024))
-	
-	if duration.Seconds() > 0 {
-		fmt.Printf("📈 Average Packet Rate: %.2f packets/sec\n", float64(packets)/duration.Seconds())
-		fmt.Printf("📈 Average Data Rate: %.2f KB/sec\n", float64(bytes)/duration.Seconds()/1024)
-	}
-	
-	fmt.Printf("🗜️  Compression Stats: %d compressed | %d decompressed | %d errors\n", compressed, decompressed, errors)
-	
-	if compressed > 0 {
-		fmt.Printf("✅ Decompression Success Rate: %.1f%%\n", float64(decompressed)/float64(compressed)*100)
-	}
-	
-	fmt.Println("\n🎯 MESSAGE 7340 STATISTICS:")
-	fmt.Printf("   Messages Received: %d\n", msg7340)
-	fmt.Printf("   Records Saved to CSV: %d\n", saved7340)
-	
-	if msg7340 > 0 {
-		successRate := float64(saved7340) / float64(msg7340) * 100
-		fmt.Printf("   Processing Success Rate: %.1f%%\n", successRate)
-		
-		if duration.Seconds() > 0 {
-			fmt.Printf("   Average 7340 Rate: %.2f messages/sec\n", float64(msg7340)/duration.Seconds())
-		}
-	}
-	
-	fmt.Println("\n📁 OUTPUT FILE: Check csv_output_2/ directory for message_7340_*.csv")
-	
-	if packets == 0 {
-		fmt.Println("\n⚠️  WARNING: No packets received!")
-		fmt.Println("   Possible reasons:")
-		fmt.Println("   - NSE multicast feed not available")
-		fmt.Println("   - Market hours (9:15 AM - 3:30 PM IST)")
-		fmt.Println("   - Firewall blocking UDP multicast")
-		fmt.Println("   - Network connection issues")
-	} else if msg7340 == 0 {
-		fmt.Println("\n⚠️  WARNING: No 7340 messages received!")
-		fmt.Println("   This message type may not be active during current market session")
-	} else {
-		fmt.Printf("\n✅ SUCCESS: Processed %d message 7340 records\n", saved7340)
-	}
-	
-	fmt.Println(strings.Repeat("=", 80))
+	fmt.Printf("\n📊 Final Statistics:\n")
+	fmt.Printf("Runtime: %v | Packets: %d | 17130: %d messages, %d records saved to CSV\n", 
+		duration, packets, msg17130, saved17130)
 }
